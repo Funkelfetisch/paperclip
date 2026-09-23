@@ -364,6 +364,59 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .toEqual([expect.objectContaining({ status: "active", returnOwnerAgentId: agentId })]);
   });
 
+  it("preserves a terminal local claim without a stored process identity", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    const environmentId = await db.select({ id: environments.id }).from(environments)
+      .where(eq(environments.driver, "local")).then((rows) => rows[0]!.id);
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Ambiguous local lease", status: "todo", assigneeAgentId: agentId,
+    });
+    await db.update(heartbeatRuns).set({
+      status: "interrupted", runtimeMode: "legacy", processPid: null, processGroupId: null,
+      contextSnapshot: { issueId }, controllerLeaseExpiresAt: new Date(0),
+    }).where(eq(heartbeatRuns.id, runningRunId));
+    const [lease] = await db.insert(environmentLeases).values({
+      companyId, environmentId, issueId, heartbeatRunId: runningRunId,
+      status: "active", provider: "local", providerLeaseId: null,
+    }).returning();
+
+    await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)))
+      .toEqual([expect.objectContaining({ status: "active", releasedAt: null })]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
+  it("rolls back the lease release when recovery materialization fails", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    const environmentId = await db.select({ id: environments.id }).from(environments)
+      .where(eq(environments.driver, "local")).then((rows) => rows[0]!.id);
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Atomic local lease recovery", status: "todo", assigneeAgentId: agentId,
+    });
+    await db.update(heartbeatRuns).set({
+      status: "interrupted", runtimeMode: "legacy", processPid: 2_000_000_000,
+      contextSnapshot: { issueId }, controllerLeaseExpiresAt: new Date(0),
+    }).where(eq(heartbeatRuns.id, runningRunId));
+    const [lease] = await db.insert(environmentLeases).values({
+      companyId, environmentId, issueId, heartbeatRunId: runningRunId,
+      status: "active", provider: "local", providerLeaseId: null,
+    }).returning();
+
+    await expect(recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      afterOrphanedLeaseRelease: async () => { throw new Error("simulated recovery write failure"); },
+    }).sweepStaleIssueLocks()).rejects.toThrow("simulated recovery write failure");
+
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)))
+      .toEqual([expect.objectContaining({ status: "active", releasedAt: null })]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
   it.each([
     { label: "live local", driver: "local", provider: "local", providerLeaseId: null, processPid: process.pid },
     { label: "remote provider", driver: "sandbox", provider: "daytona", providerLeaseId: "remote-1", processPid: 2_000_000_000 },

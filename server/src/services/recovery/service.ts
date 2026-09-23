@@ -906,6 +906,7 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    afterOrphanedLeaseRelease?: (runId: string) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -5778,26 +5779,25 @@ export function recoveryService(
       ));
     for (const { lease, run } of orphanedLocalClaims) {
       if (runningProcesses.has(run.id)) continue;
+      if (run.processPid === null && run.processGroupId === null) continue;
       const pidAlive = typeof run.processPid === "number" && isPidAlive(run.processPid);
       const groupAlive = typeof run.processGroupId === "number" && isProcessGroupAlive(run.processGroupId);
       if (pidAlive || groupAlive) continue;
-      const released = await db.update(environmentLeases).set({
-        status: "expired",
-        releasedAt: new Date(),
-        cleanupStatus: "success",
-        failureReason: "orphaned_terminal_local_run",
-        updatedAt: new Date(),
-      }).where(and(
-        eq(environmentLeases.id, lease.id),
-        inArray(environmentLeases.status, ["active", "pending_cleanup"]),
-        isNull(environmentLeases.providerLeaseId),
-      )).returning({ id: environmentLeases.id });
-      if (released.length === 0) continue;
       await terminalizeLegacyExecution({
         db,
         run,
         status: run.status,
         fromStatuses: [run.status],
+        orphanedLocalLease: {
+          id: lease.id,
+          processPid: run.processPid,
+          processGroupId: run.processGroupId,
+          controllerBootId: run.controllerBootId,
+          controllerLeaseExpiresAt: run.controllerLeaseExpiresAt,
+          afterRelease: deps.afterOrphanedLeaseRelease
+            ? () => deps.afterOrphanedLeaseRelease!(run.id)
+            : undefined,
+        },
       });
     }
 

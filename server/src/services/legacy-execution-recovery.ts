@@ -2,7 +2,7 @@ import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
@@ -55,6 +55,14 @@ export async function terminalizeLegacyExecution(input: {
   status: string;
   patch?: Partial<typeof heartbeatRuns.$inferInsert>;
   fromStatuses?: string[];
+  orphanedLocalLease?: {
+    id: string;
+    processPid: number | null;
+    processGroupId: number | null;
+    controllerBootId: string | null;
+    controllerLeaseExpiresAt: Date | null;
+    afterRelease?: () => Promise<void>;
+  };
 }) {
   const { db, run, status, patch } = input;
   const issueId =
@@ -66,6 +74,42 @@ export async function terminalizeLegacyExecution(input: {
     await tx.execute(
       sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
     );
+    const [currentRun] = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+      .for("update");
+    if (!currentRun || !(input.fromStatuses ?? [run.status]).includes(currentRun.status)) return null;
+
+    const orphanedLease = input.orphanedLocalLease;
+    let lockedLease: typeof environmentLeases.$inferSelect | null = null;
+    if (orphanedLease) {
+      // Missing process identity is missing telemetry, not proof of death.
+      if (orphanedLease.processPid === null && orphanedLease.processGroupId === null) return null;
+      const sameDate = (left: Date | null, right: Date | null) =>
+        left === null ? right === null : right !== null && left.getTime() === right.getTime();
+      if (
+        currentRun.processPid !== orphanedLease.processPid ||
+        currentRun.processGroupId !== orphanedLease.processGroupId ||
+        currentRun.controllerBootId !== orphanedLease.controllerBootId ||
+        !sameDate(currentRun.controllerLeaseExpiresAt, orphanedLease.controllerLeaseExpiresAt)
+      ) return null;
+      [lockedLease] = await tx
+        .select()
+        .from(environmentLeases)
+        .where(and(
+          eq(environmentLeases.id, orphanedLease.id),
+          eq(environmentLeases.companyId, run.companyId),
+          eq(environmentLeases.heartbeatRunId, run.id),
+        ))
+        .for("update");
+      if (
+        !lockedLease ||
+        !["active", "pending_cleanup"].includes(lockedLease.status) ||
+        lockedLease.providerLeaseId !== null
+      ) return null;
+    }
+
     const [task] = issueId
       ? await tx
           .select()
@@ -92,6 +136,20 @@ export async function terminalizeLegacyExecution(input: {
       )
       .returning();
     if (!updated) return null;
+    if (lockedLease) {
+      await tx.update(environmentLeases).set({
+        status: "expired",
+        releasedAt: new Date(),
+        cleanupStatus: "success",
+        failureReason: "orphaned_terminal_local_run",
+        updatedAt: new Date(),
+      }).where(and(
+        eq(environmentLeases.id, lockedLease.id),
+        inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+        eq(environmentLeases.heartbeatRunId, run.id),
+      ));
+      await orphanedLease?.afterRelease?.();
+    }
     if (task?.executionRunId === run.id)
       await tx
         .update(issues)
