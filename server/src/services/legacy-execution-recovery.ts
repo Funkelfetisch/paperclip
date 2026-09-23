@@ -2,7 +2,7 @@ import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
@@ -94,18 +94,22 @@ export async function terminalizeLegacyExecution(input: {
         currentRun.controllerBootId !== orphanedLease.controllerBootId ||
         !sameDate(currentRun.controllerLeaseExpiresAt, orphanedLease.controllerLeaseExpiresAt)
       ) return null;
-      [lockedLease] = await tx
-        .select()
+      const [lockedOwnership] = await tx
+        .select({ lease: environmentLeases, environmentDriver: environments.driver })
         .from(environmentLeases)
+        .innerJoin(environments, eq(environments.id, environmentLeases.environmentId))
         .where(and(
           eq(environmentLeases.id, orphanedLease.id),
           eq(environmentLeases.companyId, run.companyId),
           eq(environmentLeases.heartbeatRunId, run.id),
         ))
         .for("update");
+      lockedLease = lockedOwnership?.lease ?? null;
       if (
         !lockedLease ||
         !["active", "pending_cleanup"].includes(lockedLease.status) ||
+        (lockedLease.provider !== null && lockedLease.provider !== "local") ||
+        lockedOwnership?.environmentDriver !== "local" ||
         lockedLease.providerLeaseId !== null
       ) return null;
     }

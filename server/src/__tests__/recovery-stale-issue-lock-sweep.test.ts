@@ -417,6 +417,40 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .toHaveLength(0);
   });
 
+  it("preserves a claim reassigned to a provider after stale-candidate selection", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    const environmentId = await db.select({ id: environments.id }).from(environments)
+      .where(eq(environments.driver, "local")).then((rows) => rows[0]!.id);
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Provider reassignment race", status: "todo", assigneeAgentId: agentId,
+    });
+    await db.update(heartbeatRuns).set({
+      status: "interrupted", runtimeMode: "legacy", processPid: 2_000_000_000,
+      contextSnapshot: { issueId }, controllerLeaseExpiresAt: new Date(0),
+    }).where(eq(heartbeatRuns.id, runningRunId));
+    const [lease] = await db.insert(environmentLeases).values({
+      companyId, environmentId, issueId, heartbeatRunId: runningRunId,
+      status: "active", provider: "local", providerLeaseId: null,
+    }).returning();
+
+    await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      beforeOrphanedLeaseReconciliation: async () => {
+        await db.update(environmentLeases).set({ provider: "daytona" })
+          .where(eq(environmentLeases.id, lease!.id));
+        await db.update(environments).set({ driver: "sandbox" })
+          .where(eq(environments.id, environmentId));
+      },
+    }).sweepStaleIssueLocks();
+    await db.update(environments).set({ driver: "local" }).where(eq(environments.id, environmentId));
+
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)))
+      .toEqual([expect.objectContaining({ status: "active", provider: "daytona", releasedAt: null })]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
   it.each([
     { label: "live local", driver: "local", provider: "local", providerLeaseId: null, processPid: process.pid },
     { label: "remote provider", driver: "sandbox", provider: "daytona", providerLeaseId: "remote-1", processPid: 2_000_000_000 },

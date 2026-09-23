@@ -906,6 +906,7 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    beforeOrphanedLeaseReconciliation?: (runId: string) => Promise<void>;
     afterOrphanedLeaseRelease?: (runId: string) => Promise<void>;
   },
 ) {
@@ -5783,6 +5784,7 @@ export function recoveryService(
       const pidAlive = typeof run.processPid === "number" && isPidAlive(run.processPid);
       const groupAlive = typeof run.processGroupId === "number" && isProcessGroupAlive(run.processGroupId);
       if (pidAlive || groupAlive) continue;
+      await deps.beforeOrphanedLeaseReconciliation?.(run.id);
       await terminalizeLegacyExecution({
         db,
         run,
