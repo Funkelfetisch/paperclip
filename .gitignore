@@ -42,6 +42,8 @@ server/src/**/*.js
 server/src/**/*.js.map
 server/src/**/*.d.ts
 server/src/**/*.d.ts.map
+# Hand-written global type augmentation, not a build artifact
+!server/src/types/express.d.ts
 tmp/
 feedback-export-*
 diagnostics/
