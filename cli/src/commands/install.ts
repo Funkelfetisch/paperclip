@@ -278,6 +278,14 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // release.sh copies the repo-root skills/ directory into each bundled package
+    // (server, adapters) before packaging; a plain git-ref checkout never runs that
+    // step, so server/package.json's "files":["skills"] entry is missing on disk and
+    // prepare-bundled-package.mjs fails with ENOENT on every fresh git-ref install.
+    const rootSkillsDir = path.join(checkoutPath, "skills");
+    const serverSkillsDir = path.join(checkoutPath, "server", "skills");
+    fs.rmSync(serverSkillsDir, { recursive: true, force: true });
+    fs.cpSync(rootSkillsDir, serverSkillsDir, { recursive: true });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
