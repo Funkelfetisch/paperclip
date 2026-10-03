@@ -3898,7 +3898,8 @@ export function issueRoutes(
     // issue is still assigned to the key's agent. A long-lived ingress worker
     // has no heartbeat run, but must not influence any other assigned issue.
     if (kind === "comment" && isTaskBridgeKeyActor(req) &&
-        req.actor.keyScope?.parentIssueId === issue.id &&
+        req.actor.keyScope?.kind === "task_bridge" &&
+        req.actor.keyScope.parentIssueId === issue.id &&
         issue.assigneeAgentId === req.actor.agentId) return true;
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
